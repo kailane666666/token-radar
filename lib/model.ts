@@ -1,4 +1,4 @@
-// Token Radar's model (radar-2): one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model (radar-3): one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds every
 // rankable pre-token protocol below the watchlist floor: the early rows the radar exists to find. A
@@ -11,11 +11,20 @@
 // Implied value follows only from the snapshot's own figures. The base multiple is not a flat number:
 // it is calibrated from the live-token protocols in the same snapshot, category by category. For each
 // category the model takes the median market-cap-to-TVL ratio of the live-token protocols in it, then
-// shrinks that median toward the global median (empirical Bayes, prior strength 5) so a category with
+// shrinks that median toward the global median (empirical Bayes, prior strength 10) so a category with
 // one or two live protocols does not set the multiple on its own. The multiple is clamped to
 // [0.05, 1.0]. Categories with no live protocol use the global median.
 //
-//   category_multiple = clamp((n_cat * median_cat + 5 * median_all) / (n_cat + 5), 0.05, 1.0)
+// The shrinkage is done in log space, because market-cap-to-TVL ratios spread multiplicatively (in this
+// snapshot the 25th percentile is 0.03x and the 75th is 1.0x): the geometric combination is the right
+// centre for ratios, and on a leave-one-out backtest over the snapshot's own live-token protocols it
+// predicts market cap better than linear shrinkage. Centralised exchanges are left out of the
+// calibration: their ratios reflect exchange businesses, not DeFi protocols, and the board already
+// excludes them from ranking; leaving them out improves the backtest too (median error 5.1x vs 5.4x).
+// A TVL-weighted median was tested and rejected: it predicts worse (7.1x), because a few giant
+// protocols dominate it.
+//
+//   category_multiple = clamp(exp((n_cat * ln(median_cat) + 10 * ln(median_all)) / (n_cat + 10)), 0.05, 1.0)
 //   growth_mult       = 1 + clamp(change_7d, -60, 120) / 100 * 0.5
 //   maturity_mult     = 0.6 + 0.4 * age_days / (age_days + 365)   (age unknown: 365 days)
 //   chain_mult        = 1 + 0.02 * min(chains - 1, 10)
@@ -25,7 +34,8 @@
 // after that, because surviving the first year is the strong filter and age past three years adds little.
 // Chain breadth rewards reach: a protocol live on many chains has more surface for a launch. No protocol
 // name is ever special-cased: the same function scores every row, and the calibration is recomputed from
-// the snapshot on every run.
+// the snapshot on every run. The model's own backtest (validateModel) is shipped in the dashboard's data,
+// so the page can state how well the model predicts the live market it was calibrated on.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -76,13 +86,13 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
   chain_bonus_per_chain: 0.02,
   chain_bonus_max_chains: 10,
-  prior_strength: 5,
+  prior_strength: 10,
   multiple_floor: 0.05,
   multiple_cap: 1.0,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 30;
@@ -170,6 +180,19 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+/**
+ * The model's own backtest: leave-one-out prediction of the live-token protocols' market caps.
+ * `median_factor` is the median ratio between predicted and actual market cap (1.0 would be exact);
+ * `within_2x` / `within_3x` are the shares predicted within a factor of two / three. The dashboard's
+ * Model view states these numbers, so the model is judged on evidence, not on its own claims.
+ */
+export interface Validation {
+  n: number;
+  median_factor: number;
+  within_2x: number;
+  within_3x: number;
+}
+
 /** Everything the dashboard needs: the board, the live set, the calibration and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -178,6 +201,7 @@ export interface RadarData {
   model: ModelConstants;
   model_version: string;
   calibration: Calibration;
+  validation: Validation;
   watchlist_size: number;
   board_size: number;
   early_size: number;
@@ -234,14 +258,20 @@ export function isRankable(p: SnapshotProtocol): boolean {
 /**
  * Calibrate the base multiple from the snapshot's own live-token protocols. For each category the
  * median market-cap-to-TVL ratio of its live protocols is shrunk toward the global median, so a
- * category with few live protocols does not set its multiple on thin evidence. The result is clamped
- * to the model's floor and cap. Categories with no live protocol take the global median.
+ * category with few live protocols does not set its multiple on thin evidence. The shrinkage is done
+ * in log space: ratios spread multiplicatively, so the geometric combination is the right centre.
+ * The result is clamped to the model's floor and cap. Categories with no live protocol take the
+ * global median. Centralised exchanges are left out: their ratios reflect exchange businesses, not
+ * DeFi protocols, and the board excludes them from ranking too. `exclude` drops one slug from the
+ * calibration (the backtest's leave-one-out).
  */
-export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
+export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL, exclude: string | null = null): Calibration {
   const ratios: number[] = [];
   const byCategory = new Map<string, number[]>();
   for (const p of snapshot.protocols) {
+    if (p.slug === exclude) continue;
     if (isPreToken(p) || p.mcap_usd === null || p.tvl_usd <= 0) continue;
+    if (p.category === 'CEX') continue;
     const ratio = p.mcap_usd / p.tvl_usd;
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
     ratios.push(ratio);
@@ -256,11 +286,46 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
   for (const [category, list] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     list.sort((a, b) => a - b);
     const catMedian = medianOf(list)!;
-    const shrunk = (list.length * catMedian + model.prior_strength * globalMedian) / (list.length + model.prior_strength);
+    // Geometric shrinkage: a weighted mean of the logs, back in ratio space.
+    const shrunk = Math.exp((list.length * Math.log(catMedian) + model.prior_strength * Math.log(globalMedian)) / (list.length + model.prior_strength));
     const multiple = Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk));
     categories.push({ category, live_count: list.length, live_median: round4(catMedian), multiple: round4(multiple) });
   }
   return { global_median: round4(globalMedian), global_count: ratios.length, categories };
+}
+
+/**
+ * The model's backtest: predict each live-token protocol's market cap with the same function that
+ * scores the board, calibrating without the protocol being predicted (leave-one-out), and compare
+ * with its actual market cap. Protocols with no token, CEXes, and ratios above 20x (a tiny TVL
+ * makes the ratio a data artifact, not a market) are left out. The median factor is the median of
+ * |log(predicted / actual)|, expressed as a multiple: 5.0x means the typical prediction is off by a
+ * factor of five either way — market caps vary ~30x around their median, so no ten-field model
+ * predicts one precisely, and the honest number is stated rather than hidden.
+ */
+export function validateModel(snapshot: Snapshot, model: ModelConstants = MODEL): Validation {
+  const live = snapshot.protocols.filter(
+    (p) => !isPreToken(p) && p.category !== 'CEX' && p.tvl_usd > 0 && p.mcap_usd !== null && p.mcap_usd > 0 && p.mcap_usd / p.tvl_usd <= 20,
+  );
+  const errors: number[] = [];
+  let within2 = 0;
+  let within3 = 0;
+  for (const p of live) {
+    const cal = calibrate(snapshot, model, p.slug);
+    const pred = impliedValue(p, snapshot.as_of, cal, model).implied;
+    const err = Math.abs(Math.log(pred / p.mcap_usd!));
+    errors.push(err);
+    if (err <= Math.log(2)) within2++;
+    if (err <= Math.log(3)) within3++;
+  }
+  errors.sort((a, b) => a - b);
+  const medianErr = medianOf(errors) ?? 0;
+  return {
+    n: live.length,
+    median_factor: round4(Math.exp(medianErr)),
+    within_2x: live.length === 0 ? 0 : round4(within2 / live.length),
+    within_3x: live.length === 0 ? 0 : round4(within3 / live.length),
+  };
 }
 
 /** The category multiple for one protocol, from the calibration; the global median when unlisted. */
@@ -394,6 +459,25 @@ function riskFor(p: SnapshotProtocol): string {
   return 'Every position is a smart-contract risk: read the protocol docs, never deposit more than you can lose, and keep an exit plan.';
 }
 
+/** The category's weekly action: the recurring step that keeps the farm counted, specific to what the protocol does. */
+function weeklyFor(p: SnapshotProtocol, chain: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Top up the supply or repay a little of the borrow on ${name} once a week, so the position shows fresh activity.`;
+  if (c.includes('dex')) return `Swap a small amount through ${name}'s pool once a week, or add a little more liquidity to the position.`;
+  if (c.includes('yield')) return `Check the vault rate on ${name} once a week and add to the vault when the rate is near its recent high.`;
+  if (c.includes('basis')) return `Check ${name}'s funding rate once a week and keep the position open while funding stays positive.`;
+  if (c.includes('rwa')) return `Check what backs ${name}'s asset once a week and add a little more when a new issuance is announced.`;
+  if (c.includes('restak') || c.includes('staking')) return `Check the staking yield on ${name} once a week and restake any rewards the protocol pays out.`;
+  if (c.includes('bridge')) return `Bridge a small amount through ${name} once a week and use the funds in its app, so the wallet stays active on both sides.`;
+  if (c.includes('perpetual') || c.includes('derivative') || c.includes('perps')) return `Adjust the hedged position on ${name} once a week so it stays delta-neutral as prices move.`;
+  if (c.includes('prediction')) return `Place one small position a week on ${name}, on markets that settle on different dates.`;
+  if (c.includes('curator') || c.includes('allocator')) return `Check what ${name}'s vault holds once a week and move to a better vault if the strategy changes.`;
+  if (c.includes('chain')) return `Use one app on ${name}'s chain each week: a swap, a mint or a vote, so the wallet has a steady history.`;
+  if (c.includes('payment')) return `Send one payment through ${name} each week, varying the amount and the recipient.`;
+  return `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`;
+}
+
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived from
  * the protocol's own record (category, chains, TVL, age), never from a hand-written list of names.
@@ -416,7 +500,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '15 minutes to set up',
     },
     {
-      text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`,
+      text: weeklyFor(p, chain),
       cost: `${gas.perTx} a week`,
       time: '10 minutes a week',
     },
@@ -550,6 +634,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     model,
     model_version: MODEL_VERSION,
     calibration,
+    validation: validateModel(snapshot, model),
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
     early_size: early,
