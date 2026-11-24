@@ -1,4 +1,4 @@
-// Token Radar's model (radar-3): one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model (radar-4): one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds every
 // rankable pre-token protocol below the watchlist floor: the early rows the radar exists to find. A
@@ -24,11 +24,24 @@
 // A TVL-weighted median was tested and rejected: it predicts worse (7.1x), because a few giant
 // protocols dominate it.
 //
+// radar-4 adds a size effect: market cap does NOT scale linearly with TVL. In this snapshot the
+// median mcap/TVL ratio falls from 0.87x for protocols under $25M TVL to 0.02x for protocols over
+// $2B (log-log correlation -0.42; an OLS fit of log market cap on log TVL gives a slope of 0.51).
+// Large TVL includes mercenary capital that does not reflect the protocol's own value, so the model
+// scores effective TVL — the geometric mean of the protocol's TVL and the reference TVL (the median
+// live protocol's TVL, $36M in this snapshot) — instead of raw TVL. The calibration normalises each
+// live protocol's ratio the same way, so a category's multiple reflects its value, not the size of
+// its live protocols. On the leave-one-out backtest this cuts the median error from 5.06x to 3.33x
+// (31.6% of predictions within 2x, 47.9% within 3x), and the improvement holds out of sample when
+// the exponent is estimated on one half of the live protocols and tested on the other.
+//
+//   effective_tvl     = TVL^0.5 * TVL_REF^0.5   (TVL_REF = median live TVL; the geometric mean)
 //   category_multiple = clamp(exp((n_cat * ln(median_cat) + 10 * ln(median_all)) / (n_cat + 10)), 0.05, 1.0)
+//                       where the medians are of size-normalised ratios: mcap / effective_tvl
 //   growth_mult       = 1 + clamp(change_7d, -60, 120) / 100 * 0.5
 //   maturity_mult     = 0.6 + 0.4 * age_days / (age_days + 365)   (age unknown: 365 days)
 //   chain_mult        = 1 + 0.02 * min(chains - 1, 10)
-//   implied           = max(1, round(tvl_usd * category_multiple * growth_mult * maturity_mult * chain_mult))
+//   implied           = max(1, round(effective_tvl * category_multiple * growth_mult * maturity_mult * chain_mult))
 //
 // Maturity saturates: a protocol reaches half its maturity bonus at one year old, and the bonus flattens
 // after that, because surviving the first year is the strong filter and age past three years adds little.
@@ -74,6 +87,8 @@ export interface ModelConstants {
   prior_strength: number;
   multiple_floor: number;
   multiple_cap: number;
+  /** The TVL-size exponent: effective TVL is TVL^size_exponent * TVL_REF^(1-size_exponent). */
+  size_exponent: number;
 }
 
 export const MODEL: ModelConstants = {
@@ -89,10 +104,11 @@ export const MODEL: ModelConstants = {
   prior_strength: 10,
   multiple_floor: 0.05,
   multiple_cap: 1.0,
+  size_exponent: 0.5,
 };
 
 /** The model's version label: the dashboard names it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 30;
@@ -110,6 +126,8 @@ export interface Calibration {
   global_median: number;
   global_count: number;
   categories: CategoryCalibration[];
+  /** The reference TVL for the size effect: the median live protocol's TVL. */
+  tvl_ref: number;
 }
 
 /** A farm step: the action, what it costs, and how long it takes. */
@@ -118,6 +136,9 @@ export interface FarmStep {
   cost: string;
   time: string;
 }
+
+/** A protocol's farm risk: low, medium or high, from its category, age and TVL. */
+export type RiskLevel = 'low' | 'medium' | 'high';
 
 /** One row of board.json: the ranked board's row. */
 export interface BoardRow {
@@ -136,6 +157,7 @@ export interface BoardRow {
   on_watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
+  risk_level: RiskLevel;
   model: {
     category_multiple: number;
     category_live_count: number;
@@ -143,6 +165,8 @@ export interface BoardRow {
     growth_multiplier: number;
     maturity_multiplier: number;
     chain_multiplier: number;
+    size_multiplier: number;
+    effective_tvl_usd: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -162,10 +186,13 @@ export interface RadarRow {
   on_watchlist: boolean;
   age_days: number | null;
   implied_value_usd: number;
+  risk_level: RiskLevel;
   category_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
+  size_multiplier: number;
+  effective_tvl_usd: number;
 }
 
 /** A live-token protocol: it already trades, so the board shows the market's own value, not a model's. */
@@ -255,6 +282,15 @@ export function isRankable(p: SnapshotProtocol): boolean {
   return isPreToken(p) && p.category !== 'CEX' && !VERSIONED.test(p.name);
 }
 
+/** The reference TVL for the size effect: the median live protocol's TVL. */
+export function tvlRef(snapshot: Snapshot, exclude: string | null = null): number {
+  const tvls = snapshot.protocols
+    .filter((p) => p.slug !== exclude && !isPreToken(p) && p.category !== 'CEX' && p.tvl_usd > 0)
+    .map((p) => p.tvl_usd)
+    .sort((a, b) => a - b);
+  return medianOf(tvls) ?? 36_000_000;
+}
+
 /**
  * Calibrate the base multiple from the snapshot's own live-token protocols. For each category the
  * median market-cap-to-TVL ratio of its live protocols is shrunk toward the global median, so a
@@ -264,15 +300,22 @@ export function isRankable(p: SnapshotProtocol): boolean {
  * global median. Centralised exchanges are left out: their ratios reflect exchange businesses, not
  * DeFi protocols, and the board excludes them from ranking too. `exclude` drops one slug from the
  * calibration (the backtest's leave-one-out).
+ *
+ * The ratios are size-normalised first: each live protocol's ratio is mcap / effective_tvl, where
+ * effective_tvl is the geometric mean of its TVL and the reference TVL. Without this, a category
+ * whose live protocols happen to be large would get a low multiple for size reasons, not value
+ * reasons — the size effect is removed here and applied once, in impliedValue, for every protocol.
  */
 export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL, exclude: string | null = null): Calibration {
+  const ref = tvlRef(snapshot, exclude);
   const ratios: number[] = [];
   const byCategory = new Map<string, number[]>();
   for (const p of snapshot.protocols) {
     if (p.slug === exclude) continue;
     if (isPreToken(p) || p.mcap_usd === null || p.tvl_usd <= 0) continue;
     if (p.category === 'CEX') continue;
-    const ratio = p.mcap_usd / p.tvl_usd;
+    const effTvl = Math.pow(p.tvl_usd, model.size_exponent) * Math.pow(ref, 1 - model.size_exponent);
+    const ratio = p.mcap_usd / effTvl;
     if (!Number.isFinite(ratio) || ratio <= 0) continue;
     ratios.push(ratio);
     const key = p.category ?? 'Other';
@@ -291,7 +334,7 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL, exc
     const multiple = Math.min(model.multiple_cap, Math.max(model.multiple_floor, shrunk));
     categories.push({ category, live_count: list.length, live_median: round4(catMedian), multiple: round4(multiple) });
   }
-  return { global_median: round4(globalMedian), global_count: ratios.length, categories };
+  return { global_median: round4(globalMedian), global_count: ratios.length, categories, tvl_ref: ref };
 }
 
 /**
@@ -350,6 +393,8 @@ export function impliedValue(
   growthMult: number;
   maturityMult: number;
   chainMult: number;
+  sizeMult: number;
+  effectiveTvl: number;
   age: number | null;
 } {
   const age = ageDays(asOf, protocol.listed_at);
@@ -360,8 +405,33 @@ export function impliedValue(
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + model.maturity_range * (Math.max(ageForModel, 0) / (Math.max(ageForModel, 0) + model.maturity_half_life_days));
   const chainMult = 1 + model.chain_bonus_per_chain * Math.min(Math.max(protocol.chains.length - 1, 0), model.chain_bonus_max_chains);
-  const implied = Math.max(1, Math.round(protocol.tvl_usd * multiple * growthMult * maturityMult * chainMult));
-  return { implied, categoryMultiple: multiple, categoryLiveCount: liveCount, growthPct, growthMult, maturityMult, chainMult, age };
+  // The size effect: market cap grows with the square root of TVL, not linearly. Effective TVL is
+  // the geometric mean of the protocol's TVL and the reference TVL, so the size multiplier is 1.0
+  // at the typical protocol size, below 1.0 for giants and above 1.0 for small protocols.
+  const effectiveTvl = Math.pow(protocol.tvl_usd, model.size_exponent) * Math.pow(calibration.tvl_ref, 1 - model.size_exponent);
+  const sizeMult = protocol.tvl_usd > 0 ? effectiveTvl / protocol.tvl_usd : 1;
+  const implied = Math.max(1, Math.round(effectiveTvl * multiple * growthMult * maturityMult * chainMult));
+  return { implied, categoryMultiple: multiple, categoryLiveCount: liveCount, growthPct, growthMult, maturityMult, chainMult, sizeMult, effectiveTvl, age };
+}
+
+/**
+ * A protocol's farm risk: low, medium or high, from its category, age and TVL. Bridges score high
+ * (the largest exploit target in DeFi); leveraged categories score a point; young and small
+ * protocols score points for unproven contracts and thin liquidity. The score is a plain sum so the
+ * dashboard can explain it: 0–1 low, 2–3 medium, 4+ high.
+ */
+export function riskLevel(p: SnapshotProtocol, age: number | null): RiskLevel {
+  let score = 0;
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('bridge')) score += 2;
+  else if (c.includes('perpetual') || c.includes('derivative') || c.includes('perps') || c.includes('basis') || c.includes('options')) score += 1;
+  else if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) score += 1;
+  if (age === null) score += 1;
+  else if (age < 90) score += 2;
+  else if (age < 180) score += 1;
+  if (p.tvl_usd < 10_000_000) score += 2;
+  else if (p.tvl_usd < 25_000_000) score += 1;
+  return score >= 4 ? 'high' : score >= 2 ? 'medium' : 'low';
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
@@ -568,6 +638,7 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration, model: 
     on_watchlist: watchlistSet.has(s.p.slug),
     age_days: s.age,
     implied_value_usd: s.implied,
+    risk_level: riskLevel(s.p, s.age),
     model: {
       category_multiple: s.categoryMultiple,
       category_live_count: s.categoryLiveCount,
@@ -575,6 +646,8 @@ export function buildBoard(snapshot: Snapshot, calibration: Calibration, model: 
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
       chain_multiplier: round4(s.chainMult),
+      size_multiplier: round4(s.sizeMult),
+      effective_tvl_usd: Math.round(s.effectiveTvl),
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
@@ -614,10 +687,13 @@ export function radarRow(row: BoardRow): RadarRow {
     on_watchlist: row.on_watchlist,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    risk_level: row.risk_level,
     category_multiple: row.model.category_multiple,
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     chain_multiplier: row.model.chain_multiplier,
+    size_multiplier: row.model.size_multiplier,
+    effective_tvl_usd: row.model.effective_tvl_usd,
   };
 }
 

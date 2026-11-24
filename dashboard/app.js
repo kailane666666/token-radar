@@ -50,11 +50,44 @@
     var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
     var maturity = model.maturity_floor + model.maturity_range * (Math.max(age, 0) / (Math.max(age, 0) + model.maturity_half_life_days));
     var chainMult = 1 + model.chain_bonus_per_chain * Math.min(Math.max((row.chains || []).length - 1, 0), model.chain_bonus_max_chains);
+    // The size effect (radar-4): market cap grows with the square root of TVL, not linearly.
+    // Effective TVL is the geometric mean of the protocol's TVL and the reference TVL.
+    var ref = DATA.calibration.tvl_ref || 36000000;
+    var alpha = model.size_exponent === undefined ? 1 : model.size_exponent;
+    var effTvl = Math.pow(row.tvl_usd, alpha) * Math.pow(ref, 1 - alpha);
+    var sizeMult = row.tvl_usd > 0 ? effTvl / row.tvl_usd : 1;
     return {
-      implied: Math.max(1, Math.round(row.tvl_usd * cat.multiple * growthMult * maturity * chainMult)),
+      implied: Math.max(1, Math.round(effTvl * cat.multiple * growthMult * maturity * chainMult)),
       categoryMultiple: cat.multiple, categoryLiveCount: cat.liveCount,
-      growthPct: growth, growthMult: growthMult, maturityMult: maturity, chainMult: chainMult, age: age
+      growthPct: growth, growthMult: growthMult, maturityMult: maturity, chainMult: chainMult,
+      sizeMult: sizeMult, effectiveTvl: effTvl, age: age
     };
+  }
+
+  // A horizontal bar chart as inline SVG: no libraries, no network. `items` are
+  // {label, value, sub} sorted largest first; the longest bar is full width.
+  function barChart(items, maxItems) {
+    var shown = items.slice(0, maxItems || 10);
+    if (shown.length === 0) return null;
+    var max = shown[0].value || 1;
+    var rowH = 26, labelW = 170, barMax = 100, gap = 8;
+    var width = 640, height = shown.length * (rowH + gap) + 8;
+    var parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="' + height + '" viewBox="0 0 ' + width + ' ' + height + '" role="img" aria-label="Bar chart">'];
+    shown.forEach(function (it, i) {
+      var y = 8 + i * (rowH + gap);
+      var w = Math.max(2, Math.round((it.value / max) * barMax));
+      var label = String(it.label).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      var val = fmtUsd(it.value);
+      parts.push('<text x="0" y="' + (y + 17) + '" fill="#8fa1ad" font-size="12" font-family="system-ui, sans-serif">' + label.slice(0, 28) + '</text>');
+      parts.push('<rect x="' + labelW + '" y="' + y + '" width="' + (w * 3.4) + '" height="18" rx="3" fill="#2dd4a7" opacity="' + (0.45 + 0.55 * (it.value / max)).toFixed(2) + '"/>');
+      parts.push('<text x="' + (labelW + w * 3.4 + 8) + '" y="' + (y + 15) + '" fill="#e9eff4" font-size="12" font-family="ui-monospace, Menlo, monospace">' + val + '</text>');
+    });
+    parts.push('</svg>');
+    return el('div', { class: 'chart', html: parts.join('') });
+  }
+
+  function riskBadge(level) {
+    return el('span', { class: 'risk risk-' + level, text: level === 'high' ? 'High risk' : level === 'medium' ? 'Medium risk' : 'Low risk' });
   }
 
   function el(tag, attrs) {
@@ -357,6 +390,7 @@
       el('p', { class: 'note', text: top
         ? top.category + ' holds the most implied value on the board (' + fmtUsd(top.implied) + ' across ' + top.count + ' protocols, led by ' + top.top.name + '), because its protocols carry the most TVL at a multiple the live market supports. Each category multiple comes from its own live-token protocols; a category with few of them leans on the global median. Select a row to see its protocols on the board.'
         : 'No categories on the board.' }),
+      barChart(rows.map(function (c) { return { label: c.category, value: c.implied }; }), 10),
       el('div', { class: 'table-wrap' },
         el('table', null,
           el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Category' }), el('th', { scope: 'col', text: 'Rows' }), el('th', { scope: 'col', text: 'TVL' }), el('th', { scope: 'col', text: 'Implied value' }), el('th', { scope: 'col', text: 'Multiple' }), el('th', { scope: 'col', text: 'Strongest protocol' }))),
@@ -413,10 +447,13 @@
             rowFor('Rank', '#' + a.rank, '#' + b.rank, a.rank < b.rank ? 'a' : 'b'),
             rowFor('Category', a.category || 'Other', b.category || 'Other', null),
             rowFor('TVL', fmtUsd(a.tvl_usd), fmtUsd(b.tvl_usd), a.tvl_usd > b.tvl_usd ? 'a' : 'b'),
+            rowFor('Effective TVL (size-adjusted)', fmtUsd(va.effectiveTvl), fmtUsd(vb.effectiveTvl), va.effectiveTvl > vb.effectiveTvl ? 'a' : 'b'),
             rowFor('Seven-day growth', fmtPct(a.change_7d), fmtPct(b.change_7d), (a.change_7d || 0) > (b.change_7d || 0) ? 'a' : 'b'),
             rowFor('Age with no token', fmtAge(a.age_days), fmtAge(b.age_days), (a.age_days || 0) > (b.age_days || 0) ? 'a' : 'b'),
             rowFor('Chains', String((a.chains || []).length), String((b.chains || []).length), (a.chains || []).length > (b.chains || []).length ? 'a' : 'b'),
+            rowFor('Farm risk', a.risk_level || 'medium', b.risk_level || 'medium', null),
             rowFor('Category multiple', fmtMult(va.categoryMultiple) + 'x (' + va.categoryLiveCount + ' live)', fmtMult(vb.categoryMultiple) + 'x (' + vb.categoryLiveCount + ' live)', va.categoryMultiple > vb.categoryMultiple ? 'a' : 'b'),
+            rowFor('Size multiplier', 'x' + fmtMult(va.sizeMult), 'x' + fmtMult(vb.sizeMult), va.sizeMult > vb.sizeMult ? 'a' : 'b'),
             rowFor('Growth multiplier', 'x' + fmtMult(va.growthMult), 'x' + fmtMult(vb.growthMult), va.growthMult > vb.growthMult ? 'a' : 'b'),
             rowFor('Maturity multiplier', 'x' + fmtMult(va.maturityMult), 'x' + fmtMult(vb.maturityMult), va.maturityMult > vb.maturityMult ? 'a' : 'b'),
             rowFor('Chain multiplier', 'x' + fmtMult(va.chainMult), 'x' + fmtMult(vb.chainMult), va.chainMult > vb.chainMult ? 'a' : 'b'),
@@ -441,6 +478,7 @@
     list.forEach(function (r) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
       var growthClass = r.change_7d === null ? '' : r.change_7d >= 0 ? 'pos' : 'neg';
+      var trending = r.change_7d !== null && r.change_7d >= 50;
       var tr = el('tr', {
         'data-selected': state.selected === r.slug ? 'true' : 'false',
         tabindex: '0',
@@ -449,7 +487,7 @@
       },
         el('td', { class: 'num' + (r.rank <= 3 ? ' rank-top' : ''), text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
-          el('b', { text: r.name }),
+          el('b', null, r.name, trending ? el('span', { class: 'trend', text: ' TRENDING' }) : null),
           el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 3).join(', ') + (r.chains.length > 3 ? ' +' + (r.chains.length - 3) : '') : 'an unnamed chain') })
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
@@ -459,6 +497,7 @@
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
+        el('td', null, riskBadge(r.risk_level || 'medium')),
         el('td', null, el('span', { class: 'badge' + (r.on_watchlist ? ' watch' : ''), text: r.on_watchlist ? 'Watchlist' : 'Early' }))
       );
       tbody.appendChild(tr);
@@ -474,11 +513,23 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
+            el('th', { scope: 'col', text: 'Risk' }),
             el('th', { scope: 'col', text: 'Scope' })
           )),
           tbody
         )
       )
+    );
+  }
+
+  // The top ten rows as a bar chart: the board's shape at a glance.
+  function topChart() {
+    var top = DATA.rows.slice(0, 10).map(function (r) { return { label: '#' + r.rank + ' ' + r.name, value: r.implied_value_usd }; });
+    var chart = barChart(top, 10);
+    if (!chart) return null;
+    return el('section', { class: 'panel chart-panel' },
+      el('h2', { text: 'Top 10 by implied value' }),
+      chart
     );
   }
 
@@ -522,10 +573,13 @@
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'note', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked. The base multiple is calibrated from the live-token market in the same snapshot, category by category.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x ', el('b', { text: 'category_multiple' }), ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + ' + m.maturity_range + ' x age / (age + ' + m.maturity_half_life_days + ')) x (1 + ' + m.chain_bonus_per_chain + ' x min(chains - 1, ' + m.chain_bonus_max_chains + ')) )'
+        'effective_tvl = tvl_usd ^ ' + (m.size_exponent === undefined ? 1 : m.size_exponent) + ' x ' + fmtUsd(cal.tvl_ref || 36000000) + ' ^ ' + (1 - (m.size_exponent === undefined ? 1 : m.size_exponent)).toFixed(1) + '   (the geometric mean of TVL and the reference TVL)', el('br'),
+        'implied = round( effective_tvl x ', el('b', { text: 'category_multiple' }), ' x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + ' + m.maturity_range + ' x age / (age + ' + m.maturity_half_life_days + ')) x (1 + ' + m.chain_bonus_per_chain + ' x min(chains - 1, ' + m.chain_bonus_max_chains + ')) )'
       ),
-      el('p', { class: 'note', text: 'Category multiple: the median market-cap-to-TVL ratio of the live-token protocols in the category, shrunk toward the global median of ' + fmtMult(cal.global_median) + 'x (' + cal.global_count + ' live protocols) with prior strength ' + m.prior_strength + ', then clamped to [' + m.multiple_floor + ', ' + m.multiple_cap + ']. The shrinkage is done in log space — ratios spread multiplicatively, so the geometric combination is the right centre — and a category with few live protocols leans on the global median; a category with none uses it outright.' }),
+      el('p', { class: 'note', text: 'The size effect: market cap does not scale linearly with TVL. In this snapshot the median market-cap-to-TVL ratio falls from 0.87x for protocols under $25M TVL to 0.02x for protocols over $2B — large TVL includes mercenary capital that does not reflect the protocol\u2019s own value. So the model scores effective TVL (the geometric mean of a protocol\u2019s TVL and the reference TVL, the median live protocol\u2019s ' + fmtUsd(cal.tvl_ref || 36000000) + ') instead of raw TVL. The calibration normalises each live protocol\u2019s ratio the same way, so a category\u2019s multiple reflects its value, not the size of its live protocols.' }),
+      el('p', { class: 'note', text: 'Category multiple: the median size-normalised market-cap-to-effective-TVL ratio of the live-token protocols in the category, shrunk toward the global median of ' + fmtMult(cal.global_median) + 'x (' + cal.global_count + ' live protocols) with prior strength ' + m.prior_strength + ', then clamped to [' + m.multiple_floor + ', ' + m.multiple_cap + ']. The shrinkage is done in log space — ratios spread multiplicatively, so the geometric combination is the right centre — and a category with few live protocols leans on the global median; a category with none uses it outright.' }),
       el('p', { class: 'note', text: 'Maturity saturates: a protocol reaches half its maturity bonus at one year old, because surviving the first year is the strong filter and age past three years adds little. Age is the time since the protocol was first listed; an unlisted age uses ' + m.unknown_age_days + ' days. Chain breadth rewards reach: a protocol live on many chains has more surface for a launch.' }),
+      el('p', { class: 'note', text: 'Farm risk is a separate score, not part of implied value: bridges score high (the largest exploit target in DeFi), leveraged categories score a point, and young or small protocols score points for unproven contracts and thin liquidity. 0–1 points is low risk, 2–3 medium, 4 or more high.' }),
       el('div', { class: 'calib' },
         el('h3', { text: 'Backtest: how well the model predicts the live market it was calibrated on' }),
         el('p', { class: 'note', text: 'Each live-token protocol was scored by this same function with its own record left out of the calibration (leave-one-out), and the prediction compared with its actual market cap. On ' + DATA.validation.n + ' live-token protocols the typical prediction is within a factor of ' + DATA.validation.median_factor.toFixed(1) + 'x of the real market cap; ' + Math.round(DATA.validation.within_2x * 100) + '% land within 2x and ' + Math.round(DATA.validation.within_3x * 100) + '% within 3x. Market caps vary about 30x around their median, so no model with ten fields predicts one precisely — the ranking is the claim, and the backtest states how far to trust it.' })
@@ -559,7 +613,8 @@
       el('div', null,
         el('span', { class: 'badge' + (row.on_watchlist ? ' watch' : ''), text: (row.on_watchlist ? 'Watchlist' : 'Early') + ' · Rank ' + row.rank + ' of ' + DATA.board_size }),
         el('h2', { id: 'detail-title', text: row.name }),
-        el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') })
+        el('p', { class: 'sub', text: (row.category || 'Other') + ' on ' + (row.chains && row.chains.length ? row.chains.join(', ') : 'an unnamed chain') }),
+        el('p', { class: 'detail-risk' }, 'Farm risk: ', riskBadge(row.risk_level || 'medium'), el('span', { class: 'sub', text: ' from category, age and TVL — see the Model view for the scoring.' }))
       ),
       el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
     ));
@@ -570,6 +625,7 @@
       el('h3', { text: 'Implied value — the model, line by line' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
+        el('div', null, el('span', { text: 'Effective TVL (size-adjusted)' }), el('b', { class: 'num', text: fmtUsd(v.effectiveTvl) + ' → x' + fmtMult(v.sizeMult) })),
         el('div', null, el('span', { text: 'Category multiple (' + (row.category || 'Other') + ', ' + v.categoryLiveCount + ' live)' }), el('b', { class: 'num', text: fmtMult(v.categoryMultiple) + 'x' })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) + ' → x' + fmtMult(v.growthMult) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) + ' → x' + fmtMult(v.maturityMult) })),
@@ -600,7 +656,14 @@
     shell.appendChild(header());
     shell.appendChild(hero());
     shell.appendChild(controls());
-    if (state.tab === 'board') { var mv = moversStrip(); if (mv) shell.appendChild(mv); shell.appendChild(boardTable()); }
+    if (state.tab === 'board') {
+      var mv = moversStrip(); if (mv) shell.appendChild(mv);
+      // The top-10 chart is a board overview: show it only when no filter is active, so a
+      // filtered table is not pushed below the fold.
+      var unfiltered = state.q === '' && state.category === 'all' && state.chain === 'all' && state.scope === 'all';
+      if (unfiltered) { var tc = topChart(); if (tc) shell.appendChild(tc); }
+      shell.appendChild(boardTable());
+    }
     else if (state.tab === 'live') shell.appendChild(liveTable());
     else if (state.tab === 'market') shell.appendChild(marketPanel());
     else if (state.tab === 'compare') shell.appendChild(comparePanel());

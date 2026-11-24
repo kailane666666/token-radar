@@ -131,6 +131,28 @@ tbody tr[data-selected="true"] { background: rgba(45, 212, 167, 0.08); }
 .badge.live::before { background: var(--negative); }
 .rank-top { color: var(--accent); font-weight: 700; }
 
+/* Risk badges: green low, amber medium, red high. */
+.risk {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap;
+  padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border);
+}
+.risk::before { content: ""; width: 6px; height: 6px; border-radius: 50%; }
+.risk-low { color: var(--accent); border-color: rgba(45, 212, 167, 0.4); }
+.risk-low::before { background: var(--accent); }
+.risk-medium { color: var(--amber); border-color: rgba(242, 178, 60, 0.4); }
+.risk-medium::before { background: var(--amber); }
+.risk-high { color: var(--negative); border-color: rgba(242, 109, 109, 0.4); }
+.risk-high::before { background: var(--negative); }
+.trend { color: var(--amber); font-size: 10px; font-weight: 700; letter-spacing: 0.06em; }
+
+/* Bar charts (inline SVG) */
+.chart-panel { margin-bottom: var(--s4); padding: var(--s4) var(--s5); }
+.chart-panel h2 { font-size: 15px; margin-bottom: var(--s3); }
+.chart { overflow-x: auto; }
+.chart svg { min-width: 560px; display: block; }
+.detail-risk { margin-top: var(--s2); display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+
 /* Top movers */
 .movers { margin-bottom: var(--s4); padding: var(--s4) var(--s5); }
 .movers h2 { font-size: 15px; margin-bottom: var(--s3); }
